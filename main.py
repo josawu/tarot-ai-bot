@@ -1,93 +1,375 @@
-import asyncio
-import random
+"""
+Telegram-бот для раскладов Таро
+Работает с aiogram 3.x, asyncpg, PostgreSQL
+Готов к деплою на Render (Webhook)
+"""
+
 import os
-from datetime import date
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+import logging
+import random
+from datetime import datetime, date
+from typing import Optional
+
 import asyncpg
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
-TOKEN = os.getenv("TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+# ═══════════════════════════════════════════════════════════════
+# НАСТРОЙКА ЛОГИРОВАНИЯ
+# ═══════════════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-bot = Bot(token=TOKEN)
+# ═══════════════════════════════════════════════════════════════
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# ═══════════════════════════════════════════════════════════════
+# Получаем из Render Dashboard → Environment Variables
+TOKEN = os.getenv("TOKEN")  # Токен от @BotFather
+DATABASE_URL = os.getenv("DATABASE_URL")  # Строка подключения PostgreSQL
+
+# Настройки для Webhook (Render требует webhook для постоянной работы)
+WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME")  # Автоматически от Render
+WEBHOOK_PATH = f"/webhook/{TOKEN}"
+WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}" if WEBHOOK_HOST else None
+
+# Порт для Render (Render задаёт через PORT)
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", 8080))
+
+# ═══════════════════════════════════════════════════════════════
+# ДАННЫЕ ТАРО
+# ═══════════════════════════════════════════════════════════════
+
+# Колода Таро: 12 ключевых арканов с описаниями
+TAROT_DECK = {
+    "Шут": {
+        "emoji": "🃏",
+        "free_meaning": "Начало нового пути ждёт тебя. Смелость сейчас важнее осторожности — Вселенна приготовила сюрприз.",
+        "pro_meaning": "Шут символизирует чистый потенциал и нулевую точку. Ты стоишь на краю пропасти возможностей, где каждый шаг — акт веры. В твоём вопросе скрыта необходимость отпустить контроль и позволить жизни нести тебя. Это не глупость — это мудрость доверия. Старые правила больше не работают. Новая глава требует полной перезагрузки сознания. Не бойся выглядеть безрассудным — именно это качество привлечёт нужных людей и обстоятельства."
+    },
+    "Маг": {
+        "emoji": "🎩",
+        "free_meaning": "У тебя есть все инструменты для успеха. Энергия Вселенной сконцентрирована в твоих руках — используй её мудро.",
+        "pro_meaning": "Маг говорит о полной укомплектованности ресурсами. Ты обладаешь волей, эмоцией, разумом и материей — четырьмя стихиями власти. Вопрос, который ты задаёшь, уже содержит ответ внутри тебя. Время перестать искать внешние подтверждения. Твоя способность манифестировать сейчас на пике. Но помни: Маг действует осознанно, а не импульсивно. Сконцентрируй намерение — и материальный мир отзовётся мгновенно."
+    },
+    "Жрица": {
+        "emoji": "🌙",
+        "free_meaning": "Тайны раскрываются перед твоим внутренним взором. Прислушайся к интуиции — она шепчет истину, которую разум ещё не осознал.",
+        "pro_meaning": "Жрица приглашает тебя в храм подсознания. Внешний мир сейчас менее важен, чем внутренний ландшафт. Твой вопрос требует не анализа, а погружения. Есть знание, которое приходит только в тишине — между словами, в полусне, в моменты одиночества. Ты несёшь в себе древнюю мудрость, доступ к которой открывается через приёмы, а не через действия. Не спеши. Позволь ответу созреть в потёмках твоей души, прежде чем выносить его на свет."
+    },
+    "Императрица": {
+        "emoji": "👑",
+        "free_meaning": "Изобилие и плодородие окружают тебя. Творческая энергия Венеры благословляет твои начинания — природа сама содействует тебе.",
+        "pro_meaning": "Императрица — архетип материнской изобильной Вселенной. В твоём вопросе заложен потенциал роста, превышающий твои ожидания. Это время принимать, а не добиваться. Твоя задача — создать плодородную почву, а не форсировать рост. Обрати внимание на чувственный мир: цвета, запахи, прикосновения. Именно через тело приходит мудрость сейчас. Любовь к себе — не эгоизм, а необходимое условие для проявления желаний. Забота о других начинается с изобилия внутри."
+    },
+    "Император": {
+        "emoji": "⚔️",
+        "free_meaning": "Пора взять под контроль хаос. Структура и дисциплина — твои союзники сейчас. Власть приходит к тому, кто готов её нести.",
+        "pro_meaning": "Император требует установления порядка в царстве твоего вопроса. Где разбросанность — введи систему. Где эмоциональная нестабильность — найди опору в логике. Но помни: истинная власть не подавляет, а защищает. Ты создаёшь границы не для изоляции, а для сохранения ценного. В твоей ситуации нужен твёрдый план и последовательное исполнение. Авторитет придёт через ответственность, а не через контроль. Стань опорой для других — и мир ответит тебе тем же."
+    },
+    "Влюблённые": {
+        "emoji": "💕",
+        "free_meaning": "Выбор, который изменит всё. Сердце и разум ищут гармонию — прислушайся к обоим, но помни: любовь не терпит расчёта.",
+        "pro_meaning": "Влюблённые — это не только романтика, но и архетип союза противоположностей. В твоём вопросе сталкиваются два пути, два голоса, два возможных будущих. Выбор здесь неизбежен, и отсрочка — тоже выбор. Ангел над головами напоминает: высшее благо достижимо только через искренность с самим собой. Какое решение делает тебя более целостным? Какое приближает к твоей истинной природе? Отношения, которые ты рассматриваешь, могут быть зеркалом внутреннего раздвоения. Интеграция начинается с признания обеих частей."
+    },
+    "Колесо Фортуны": {
+        "emoji": "☸️",
+        "free_meaning": "Циклы жизни вращаются в твою пользу. Судьба вмешивается, нарушая планы — но именно в этом хаосе скрыт подарок.",
+        "pro_meaning": "Колесо напоминает: ты не центр Вселенной, но часть её ритма. Вопрос, который ты задаёшь, находится под влиянием космических циклов, выходящих за рамки твоего контроля. Это не повод для беспомощности — наоборот, освобождение от иллюзии контроля открывает новую стратегию. Узнай свою позицию в цикле: спад или подъём? Время действовать или время ждать? Сфинкс наверху говорит: мудрость — в гармонии с потоком, а не в борьбе против него. Примите перемену как учителя."
+    },
+    "Смерть": {
+        "emoji": "💀",
+        "free_meaning": "Конец, который есть начало. Что-то уходит навсегда — не сопротивляйся. В освободившемся пространстве родится новое.",
+        "pro_meaning": "Смерть — самая трансформативная карта колоды. В твоём вопросе зрел сценарий, который исчерпал себя. Это может быть отношение, карьера, убеждение или способ самоидентификации. Боль от потери реальна, но она временна. То, что придёт на замену, будет более аутентичным. Скорпион и орёл на карте символизируют два пути трансформации: через кризис или через сознательное возвышение. Выбор за тобой. Не пытайся воскресить то, что умерло естественной смертью — это оскверняет процесс."
+    },
+    "Башня": {
+        "emoji": "🗼",
+        "free_meaning": "Внезапное разрушение иллюзий. То, на что ты опирался, рушится — но только освобождение от лжи позволяет увидеть небо.",
+        "pro_meaning": "Башня — это не наказание, но акт милосердной Вселенной. Конструкция твоего вопроса построена на ложном фундаменте, и продолжение грозило большим крахом. Молния ударяет без предупреждения, разрушая то, что ты считал безопасным. В падающих камнях — освобождение от самообмана. Два человека, падающие с башни, представляют две части тебя: эго и душу. Только полное падение позволяет истинному Я выжить. Не торопись строить новое — сначала почувствуй землю под ногами."
+    },
+    "Луна": {
+        "emoji": "🌕",
+        "free_meaning": "Иллюзии и страхи пляшут в лунном свете. Не всё то, что кажется опасным, реально угрожает. Проверь свои ощущения на рассвете.",
+        "pro_meaning": "Луна погружает тебя в архетипическое подсознание, где правят не логика, а символы и архаические страхи. Твой вопрос окутан туманом проекций — ты видишь не ситуацию, а своё отношение к ней. Рак и волк у воды — это твои внутренние противоречия: инстинкт самосохранения и дикое желание. Путь через эту карту требует смелости столкнуться с теневыми аспектами себя. Чего ты боишься на самом деле? Ответ лежит в признании, а не в бегстве. Рассвет придёт, но сначала нужно пережить ночь."
+    },
+    "Солнце": {
+        "emoji": "☀️",
+        "free_meaning": "Ясность, радость и успех озаряют твой путь. Детская непосредственность — ключ к решению. Свет dispels все тени сомнений.",
+        "pro_meaning": "Солнце — высшее благословение колоды. В твоём вопросе присутствует элемент простоты, который ты усложняешь. Вернись к первозданной радости, к энтузиазму начинающего. Успех неизбежен, но его качество зависит от твоей внутренней чистоты намерений. Младенец на коне символизирует победу без борьбы — через подлинность, а через манипуляции. Сияние Солнца требует прозрачности: нельзя одновременно желать света и прятать тайны. Откройся миру — и мир откроется тебе во всём своём великолепии."
+    },
+    "Мир": {
+        "emoji": "🌍",
+        "free_meaning": "Цикл завершён, и ты стоишь на пороге нового уровня. Гармония достигнута через принятие всех противоположностей своей природы.",
+        "pro_meaning": "Мир — последний аркан Большого Шествия, символ интеграции и завершения. Твой вопрос находится в точке кульминации долгого пути. То, что началось как фрагментированный опыт, теперь обретает целостность. Танцующая фигура в венке — это ты, освоивший все стихии и аспекты бытия. Но завершение содержит семя нового начала. Не цепляйся за достигнутое — позволь ему трансформироваться в мудрость. Ты готов к следующему витку спирали, но сейчас — момент празднования и благодарности всему, что было."
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════
+# ИНИЦИАЛИЗАЦИЯ БОТА И ДИСПЕТЧЕРА
+# ═══════════════════════════════════════════════════════════════
+bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-tarot_cards = [
-    "Шут", "Маг", "Жрица", "Императрица",
-    "Император", "Влюбленные", "Колесо Фортуны",
-    "Смерть", "Башня", "Луна", "Солнце", "Мир"
-]
+# ═══════════════════════════════════════════════════════════════
+# РАБОТА С БАЗОЙ ДАННЫХ (PostgreSQL)
+# ═══════════════════════════════════════════════════════════════
 
-keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🔮 Бесплатный расклад")],
-        [KeyboardButton(text="💎 PRO расклад")]
-    ],
-    resize_keyboard=True
-)
-
-async def create_pool():
-    return await asyncpg.create_pool(DATABASE_URL)
-
-# Автоматическое создание таблицы
-async def init_db():
-    async with dp["db"].acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                last_free DATE
+class Database:
+    """Класс для управления подключением к PostgreSQL"""
+    
+    def __init__(self):
+        self.pool: Optional[asyncpg.Pool] = None
+    
+    async def connect(self):
+        """Создание пула соединений с базой данных"""
+        self.pool = await asyncpg.create_pool(DATABASE_URL)
+        logger.info("✅ Подключение к PostgreSQL установлено")
+    
+    async def create_tables(self):
+        """Автоматическое создание таблиц при первом запуске"""
+        async with self.pool.acquire() as conn:
+            # Создаём таблицу пользователей, если её нет
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    last_free DATE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            logger.info("✅ Таблицы проверены/созданы")
+    
+    async def get_user(self, user_id: int) -> Optional[dict]:
+        """Получение данных пользователя по ID"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE user_id = $1", 
+                user_id
             )
-        """)
+            return dict(row) if row else None
+    
+    async def update_last_free(self, user_id: int):
+        """Обновление даты последнего бесплатного расклада"""
+        today = date.today()
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users (user_id, last_free) 
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) 
+                DO UPDATE SET last_free = $2
+            """, user_id, today)
+    
+    async def can_use_free(self, user_id: int) -> bool:
+        """Проверка, может ли пользователь использовать бесплатный расклад"""
+        user = await self.get_user(user_id)
+        if not user or not user.get('last_free'):
+            return True
+        last_date = user['last_free']
+        # Если последний расклад был не сегодня — можно использовать
+        return last_date != date.today()
+
+# Глобальный объект базы данных
+db = Database()
+
+# ═══════════════════════════════════════════════════════════════
+# КЛАВИАТУРЫ
+# ═══════════════════════════════════════════════════════════════
+
+def get_main_keyboard():
+    """Главное меню выбора типа расклада"""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔮 Бесплатный расклад")],
+            [KeyboardButton(text="💎 PRO расклад")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    return keyboard
+
+def get_back_keyboard():
+    """Кнопка возврата в меню"""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="⬅️ В меню")]],
+        resize_keyboard=True
+    )
+    return keyboard
+
+# ═══════════════════════════════════════════════════════════════
+# ОБРАБОТЧИКИ КОМАНД
+# ═══════════════════════════════════════════════════════════════
 
 @dp.message(Command("start"))
-async def start(message: types.Message):
-    async with dp["db"].acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (user_id, last_free)
-            VALUES ($1, NULL)
-            ON CONFLICT (user_id) DO NOTHING
-        """, message.from_user.id)
-
-    await message.answer(
-        "🔮 Добро пожаловать в AI-Oracle\n\nВыбери расклад:",
-        reply_markup=keyboard
+async def cmd_start(message: types.Message):
+    """
+    Обработчик команды /start
+    Приветствует пользователя и показывает меню выбора
+    """
+    welcome_text = (
+        "✨ <b>Добро пожаловать в мир Таро</b> ✨\n\n"
+        "Я — ваш проводник в тайны карт. Здесь каждая карта — зеркало "
+        "вашей души, каждый расклад — шепот Вселенной.\n\n"
+        "Выберите тип расклада:"
     )
+    await message.answer(welcome_text, reply_markup=get_main_keyboard())
 
-@dp.message(lambda message: message.text == "🔮 Бесплатный расклад")
+@dp.message(F.text == "🔮 Бесплатный расклад")
 async def free_spread(message: types.Message):
-    today = date.today()
-    async with dp["db"].acquire() as conn:
-        last_free = await conn.fetchval(
-            "SELECT last_free FROM users WHERE user_id=$1",
-            message.from_user.id
+    """
+    Обработчик бесплатного расклада
+    Проверяет лимит (1 раз в день) и выдаёт случайную карту
+    """
+    user_id = message.from_user.id
+    
+    # Проверяем, не использовал ли пользователь бесплатный расклад сегодня
+    can_use = await db.can_use_free(user_id)
+    
+    if not can_use:
+        await message.answer(
+            "🌙 <b>Вы уже получали бесплатный расклад сегодня</b>\n\n"
+            "Звёзды говорят: терпение вознаграждается. "
+            "Возвращайтесь завтра за новым посланием...\n\n"
+            "Или откройте <b>PRO расклад</b> прямо сейчас 💎",
+            reply_markup=get_main_keyboard()
         )
-        if last_free == today:
-            await message.answer("Сегодня бесплатный расклад уже использован 💎")
-            return
-        await conn.execute(
-            "UPDATE users SET last_free=$1 WHERE user_id=$2",
-            today, message.from_user.id
-        )
+        return
+    
+    # Выбираем случайную карту из колоды
+    card_name = random.choice(list(TAROT_DECK.keys()))
+    card_data = TAROT_DECK[card_name]
+    
+    # Обновляем дату последнего бесплатного расклада
+    await db.update_last_free(user_id)
+    
+    # Формируем ответ
+    response = (
+        f"{card_data['emoji']} <b>{card_name}</b>\n\n"
+        f"{card_data['free_meaning']}\n\n"
+        f"<i>🌟 Полный разбор доступен в PRO версии 💎</i>\n\n"
+        f"<i>Карта выпала для вас {datetime.now().strftime('%d.%m.%Y')}</i>"
+    )
+    
+    await message.answer(response, reply_markup=get_main_keyboard())
 
-    card = random.choice(tarot_cards)
+@dp.message(F.text == "💎 PRO расклад")
+async def pro_spread_start(message: types.Message):
+    """
+    Обработчик начала PRO расклада
+    Запрашивает вопрос пользователя для персонализации
+    """
     await message.answer(
-        f"🃏 Твоя карта: {card}\n\n"
-        f"Это знак, но есть скрытая деталь...\n\n"
-        f"Полный разбор доступен в PRO версии 💎"
+        "💎 <b>PRO Расклад</b> 💎\n\n"
+        "Введите ваш вопрос или ситуацию, над которой размышляете. "
+        "Чем конкретнее формулировка — тем глубже проникнет ответ.\n\n"
+        "<i>Например: 'О чём мне нужно знать в отношениях?' или "
+        "'Какое решение приведёт к росту?'</i>",
+        reply_markup=get_back_keyboard()
     )
 
-@dp.message(lambda message: message.text == "💎 PRO расклад")
-async def pro_spread(message: types.Message):
+@dp.message(F.text == "⬅️ В меню")
+async def back_to_menu(message: types.Message):
+    """Возврат в главное меню"""
     await message.answer(
-        "💎 PRO расклад раскрывает глубинный анализ ситуации.\n\n"
-        "Скоро здесь будет подключена подписка."
+        "Возвращаемся... Выберите тип расклада:",
+        reply_markup=get_main_keyboard()
     )
 
-async def main():
-    dp["db"] = await create_pool()
-    await init_db()  # создаем таблицу автоматически
-    await dp.start_polling(bot)
+@dp.message()
+async def pro_spread_process(message: types.Message):
+    """
+    Обработчик вопроса для PRO расклада
+    Генерирует расширенный ответ с учётом контекста
+    """
+    # Если это не текстовое сообщение или это кнопка меню — игнорируем
+    if message.text in ["🔮 Бесплатный расклад", "💎 PRO расклад", "⬅️ В меню", "/start"]:
+        return
+    
+    user_question = message.text
+    user_id = message.from_user.id
+    
+    # Выбираем случайную карту (можно сделать выборку 3 карт для расклада)
+    card_name = random.choice(list(TAROT_DECK.keys()))
+    card_data = TAROT_DECK[card_name]
+    
+    # Формируем персонализированный PRO ответ
+    response = (
+        f"💎 <b>Ваш PRO расклад</b> 💎\n\n"
+        f"🔮 <b>Выпала карта: {card_name}</b> {card_data['emoji']}\n\n"
+        f"<b>Ваш вопрос:</b> <i>{user_question}</i>\n\n"
+        f"{card_data['pro_meaning']}\n\n"
+        f"━" * 20 + "\n"
+        f"<i>Этот расклад создан специально для вас. "
+        f"Сохраните его — энергия ответа будет работать 7 дней.</i>\n\n"
+        f"🌟 <b>Хотите углубиться?</b> Следующий расклад доступен сразу."
+    )
+    
+    await message.answer(response, reply_markup=get_main_keyboard())
+
+# ═══════════════════════════════════════════════════════════════
+# ЗАПУСК БОТА
+# ═══════════════════════════════════════════════════════════════
+
+async def on_startup(app: web.Application):
+    """
+    Действия при запуске:
+    1. Подключение к базе данных
+    2. Создание таблиц
+    3. Установка вебхука (для Render)
+    """
+    await db.connect()
+    await db.create_tables()
+    
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL)
+        logger.info(f"✅ Вебхук установлен: {WEBHOOK_URL}")
+    else:
+        logger.info("⚠️ Режим polling (локальная разработка)")
+
+async def on_shutdown(app: web.Application):
+    """Действия при остановке бота"""
+    await bot.delete_webhook()
+    await bot.session.close()
+    if db.pool:
+        await db.pool.close()
+    logger.info("🛑 Бот остановлен")
+
+def main():
+    """
+    Главная функция запуска
+    Определяет режим работы: Webhook (для Render) или Polling (локально)
+    """
+    if WEBHOOK_HOST:
+        # Режим Webhook для Render
+        app = web.Application()
+        
+        # Регистрация обработчиков
+        webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+        webhook_handler.register(app, path=WEBHOOK_PATH)
+        
+        # Настройка жизненного цикла
+        app.on_startup.append(on_startup)
+        app.on_shutdown.append(on_shutdown)
+        
+        setup_application(app, dp, bot=bot)
+        
+        # Запуск веб-сервера
+        web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+    else:
+        # Режим Polling для локальной разработки
+        import asyncio
+        
+        async def start_polling():
+            await db.connect()
+            await db.create_tables()
+            await dp.start_polling(bot)
+        
+        asyncio.run(start_polling())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
