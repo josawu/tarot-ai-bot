@@ -30,6 +30,16 @@ keyboard = ReplyKeyboardMarkup(
 async def create_pool():
     return await asyncpg.create_pool(DATABASE_URL)
 
+# Автоматическое создание таблицы
+async def init_db():
+    async with dp["db"].acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                last_free DATE
+            )
+        """)
+
 @dp.message(Command("start"))
 async def start(message: types.Message):
     async with dp["db"].acquire() as conn:
@@ -47,27 +57,23 @@ async def start(message: types.Message):
 @dp.message(lambda message: message.text == "🔮 Бесплатный расклад")
 async def free_spread(message: types.Message):
     today = date.today()
-
     async with dp["db"].acquire() as conn:
         last_free = await conn.fetchval(
             "SELECT last_free FROM users WHERE user_id=$1",
             message.from_user.id
         )
-
         if last_free == today:
             await message.answer("Сегодня бесплатный расклад уже использован 💎")
             return
-
         await conn.execute(
             "UPDATE users SET last_free=$1 WHERE user_id=$2",
             today, message.from_user.id
         )
 
     card = random.choice(tarot_cards)
-
     await message.answer(
         f"🃏 Твоя карта: {card}\n\n"
-        f"Это знак. Но есть скрытая деталь...\n\n"
+        f"Это знак, но есть скрытая деталь...\n\n"
         f"Полный разбор доступен в PRO версии 💎"
     )
 
@@ -80,6 +86,7 @@ async def pro_spread(message: types.Message):
 
 async def main():
     dp["db"] = await create_pool()
+    await init_db()  # создаем таблицу автоматически
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
